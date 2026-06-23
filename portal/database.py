@@ -34,13 +34,17 @@ def get_readonly_db_connection():
     role is NOSUPERUSER with SELECT granted only on the data surface, so file
     primitives (pg_read_file, lo_*) and audit/PII tables are unreachable (C2).
 
-    Falls back to the main connection when PGUSER_RO is unset (local dev or
-    before the role is provisioned). The fallback is still safe-ish because
-    execute_readonly_query wraps every query in a read-only transaction and
-    applies the identifier denylist — but provisioning the role is what makes
-    the superuser file-read vector truly impossible, so do it in prod."""
+    Falls back to the main connection when PGUSER_RO is unset (local dev only).
+    In production the deployment's secretKeyRef is optional:false, so a missing
+    Secret fails the pod rather than reaching this fallback. The fallback logs
+    loudly so the downgrade to the privileged role is never silent."""
     ro_user = os.environ.get('PGUSER_RO')
     if not ro_user:
+        logger.warning(
+            "PGUSER_RO not set — free-form SQL is running on the PRIVILEGED main "
+            "DB role. Expected only in local dev; in prod this means the "
+            "isaac-psql-readonly Secret is missing."
+        )
         return get_db_connection()
     return psycopg2.connect(
         host=os.environ.get('PGHOST', 'localhost'),
