@@ -11,12 +11,17 @@ Data flow:
 import json
 import os
 import re
+import hmac
+import base64
+import logging
 import tempfile
 import shutil
 
 import yaml
 import git
 import requests as http_requests
+
+logger = logging.getLogger("isaac-ontology")
 
 # Path to vocabulary file in data/ directory (fallback)
 VOCAB_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "vocabulary.json")
@@ -64,6 +69,61 @@ def is_admin(username: str) -> bool:
     return username.lower() in admins
 
 
+def _log_edge_probe_once(secret_set: bool, header_present: bool):
+    """Log the edge-gate state ONCE per process so an operator can confirm the
+    ingress is actually injecting X-Isaac-Edge BEFORE turning the gate on.
+    Activate EDGE_AUTH_SECRET only once this logs header_present=True — otherwise
+    the app fail-closes and locks everyone out. The env sentinel survives
+    Streamlit's per-rerun `importlib.reload(ontology)`, which would reset a
+    module global. (C1 staged rollout)"""
+    if os.environ.get("_ISAAC_EDGE_PROBE_LOGGED"):
+        return
+    os.environ["_ISAAC_EDGE_PROBE_LOGGED"] = "1"
+    if secret_set:
+        logger.info("C1 edge gate ACTIVE; X-Isaac-Edge present on first request = %s",
+                    header_present)
+    else:
+        logger.warning(
+            "C1 edge gate INACTIVE (EDGE_AUTH_SECRET unset, fail-open). "
+            "X-Isaac-Edge present on first request = %s. Activate the gate "
+            "(set EDGE_AUTH_SECRET) only after this reads True.", header_present)
+
+
+def trusted_identity(headers) -> tuple:
+    """Resolve (username, is_admin) from request headers — but only trust the
+    Authentik identity headers when the request proves it traversed the
+    ingress/forward-auth outpost by carrying the shared edge secret.
+
+    The Streamlit pod is meant to be reachable *only* through the nginx ingress
+    + Authentik outpost, which injects ``X-authentik-*`` and a server-only
+    ``X-Isaac-Edge`` secret (the ingress overwrites any client-supplied value).
+    A request that reaches the pod by any other route (an in-cluster peer, a
+    port-forward, an SSRF/misroute) cannot know the secret, so its
+    ``X-authentik-*`` headers are untrusted and the caller is anonymous.
+
+    Fail-closed whenever ``EDGE_AUTH_SECRET`` is set; fail-open with a warning
+    when it is unset (local dev, or before the secret is provisioned) so the
+    portal is never locked out by a half-finished rollout. (C1)
+    """
+    try:
+        headers = headers or {}
+    except Exception:
+        headers = {}
+
+    edge_secret = os.environ.get("EDGE_AUTH_SECRET", "")
+    presented = headers.get("X-Isaac-Edge", "") or ""
+    _log_edge_probe_once(secret_set=bool(edge_secret), header_present=bool(presented))
+
+    if edge_secret:
+        if not hmac.compare_digest(str(presented), edge_secret):
+            # Request did not come through the trusted edge — do not trust any
+            # identity headers it carries.
+            return "anonymous", False
+
+    username = headers.get("X-authentik-username", "anonymous") or "anonymous"
+    return username, is_admin(username)
+
+
 # =============================================================================
 # File-based operations (local development fallback)
 # =============================================================================
@@ -89,20 +149,49 @@ def _scrub_secrets(text) -> str:
     if tok:
         s = s.replace(tok, "***")
     s = _re.sub(r'https://[^@/\s]+@github\.com', 'https://***@github.com', s)
+    # Defense-in-depth: redact the base64 Authorization header form, in case a
+    # future code path ever lets the http.extraHeader value reach a string.
+    s = _re.sub(r'(Authorization: Basic )\S+', r'\1***', s)
     return s
 
 
 def _get_wiki_url():
-    """Get the wiki repo URL, optionally injecting GITHUB_TOKEN for auth."""
-    url = os.environ.get("WIKI_REPO_URL", "")
-    if not url:
-        return None
+    """Return the wiki repo URL.
 
+    The GITHUB_TOKEN is NEVER inlined into the URL — auth is supplied out-of-band
+    via an http.extraHeader git config (see _git_auth_env), so the token can
+    never appear in a remote URL or a GitPython error string. (H3)
+    """
+    return os.environ.get("WIKI_REPO_URL", "") or None
+
+
+def _git_auth_env():
+    """Environment that authenticates git to GitHub via an http.extraHeader,
+    injected through GIT_CONFIG_* env vars rather than a ``-c/--config`` CLI arg.
+
+    GitPython blocks ``--config`` as an unsafe clone option (UnsafeOptionError),
+    and a ``--config`` arg would also leak the header into a GitCommandError
+    cmdline. GIT_CONFIG_* keeps the token out of argv, the URL, AND .git/config.
+    Returns {} when no token is set. (H3)  [requires git >= 2.31]
+    """
     token = os.environ.get("GITHUB_TOKEN", "")
-    if token and "github.com" in url and "@" not in url:
-        # Inject token: https://github.com/... → https://<token>@github.com/...
-        url = url.replace("https://github.com/", f"https://{token}@github.com/")
-    return url
+    if not token:
+        return {}
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+    }
+
+
+def _apply_git_auth(repo):
+    """Apply http.extraHeader auth to a repo's git command env so pull/push
+    authenticate without the token touching argv, the URL, or .git/config.
+    No-op when no token is set."""
+    env = _git_auth_env()
+    if env:
+        repo.git.update_environment(**env)
 
 
 def _clone_or_pull_wiki(target_dir: str):
@@ -115,9 +204,12 @@ def _clone_or_pull_wiki(target_dir: str):
 
     if os.path.exists(os.path.join(repo_path, ".git")):
         repo = git.Repo(repo_path)
+        _apply_git_auth(repo)
         repo.remotes.origin.pull()
     else:
-        git.Repo.clone_from(url, repo_path)
+        # Auth via GIT_CONFIG_* env (NOT --config: GitPython blocks it as an
+        # unsafe clone option) and NOT a tokenized URL.
+        git.Repo.clone_from(url, repo_path, env=_git_auth_env() or None)
 
     return repo_path
 
@@ -508,6 +600,7 @@ def push_change_to_wiki(section: str, vocab_for_section: dict,
 
         # Commit and push
         repo = git.Repo(repo_path)
+        _apply_git_auth(repo)   # re-opened repo: env was not inherited from clone
         repo.index.add([f"{wiki_page}.md"])
 
         if repo.is_dirty() or repo.untracked_files:

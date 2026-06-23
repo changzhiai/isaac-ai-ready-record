@@ -10,7 +10,7 @@ import os
 import re
 import importlib
 import streamlit.components.v1 as components
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 importlib.reload(ontology)
 
@@ -43,14 +43,29 @@ if database.is_db_configured():
 # Check database status
 db_connected = database.test_db_connection()
 
-# Extract current user from Authentik headers
+# Resolve identity from Authentik headers — trusted only when the request
+# carries the edge-proxy secret (ontology.trusted_identity / C1).
 try:
     _headers = st.context.headers
-    current_username = _headers.get("X-authentik-username", "anonymous")
 except Exception:
-    current_username = "anonymous"
+    _headers = {}
 
-user_is_admin = ontology.is_admin(current_username)
+current_username, user_is_admin = ontology.trusted_identity(_headers)
+
+
+def _require_admin_action():
+    """Re-validate admin from the live request headers at the point of a
+    privileged action. Defense-in-depth beyond the page-level gate: a single
+    server-side check, evaluated fresh, mirroring the Flask API's
+    @_require_admin (H1). Halts the script run if the caller is not an admin."""
+    try:
+        _h = st.context.headers
+    except Exception:
+        _h = {}
+    _, _is_admin = ontology.trusted_identity(_h)
+    if not _is_admin:
+        st.error("Admin privileges required.")
+        st.stop()
 
 # Log portal access (once per session)
 if "access_logged" not in st.session_state:
@@ -644,6 +659,7 @@ elif page == "Admin Review":
                         btn_cols = st.columns(3)
                         with btn_cols[0]:
                             if st.button("Generate Wiki Text", key=f"gen_{pid}", type="primary"):
+                                _require_admin_action()
                                 with st.spinner("Generating wiki prose with AI..."):
                                     result = ontology.generate_wiki_description(
                                         section=prop['section'],
@@ -661,6 +677,7 @@ elif page == "Admin Review":
                                     st.error(f"LLM error: {result['error']}")
                         with btn_cols[1]:
                             if st.button("Approve (no prose)", key=f"quick_approve_{pid}"):
+                                _require_admin_action()
                                 comment = ""
                                 ok, msg = database.review_proposal(pid, "approved", current_username, comment)
                                 if ok:
@@ -674,6 +691,7 @@ elif page == "Admin Review":
                                     st.error(msg)
                         with btn_cols[2]:
                             if st.button("Reject", key=f"reject_{pid}"):
+                                _require_admin_action()
                                 ok, msg = database.review_proposal(pid, "rejected", current_username, "")
                                 if ok:
                                     st.success("Proposal rejected.")
@@ -700,6 +718,7 @@ elif page == "Admin Review":
                         confirm_cols = st.columns(3)
                         with confirm_cols[0]:
                             if st.button("Approve & Push to Wiki", key=f"confirm_{pid}", type="primary"):
+                                _require_admin_action()
                                 ok, msg = database.review_proposal(pid, "approved", current_username, review_comment)
                                 if ok:
                                     # Update proposal description with the yaml_desc if provided
@@ -723,6 +742,7 @@ elif page == "Admin Review":
                                     st.error(msg)
                         with confirm_cols[1]:
                             if st.button("Regenerate", key=f"regen_{pid}"):
+                                _require_admin_action()
                                 with st.spinner("Regenerating..."):
                                     result = ontology.generate_wiki_description(
                                         section=prop['section'],
@@ -1083,6 +1103,12 @@ elif page == "API Keys":
                     import ulid
                     identifier = f"isaac-api-{_safe_username}-{str(ulid.ULID()).lower()}"
 
+                    # Bounded TTL: keys expire so a leaked key cannot be used
+                    # indefinitely. Identity (user_pk) is resolved from the
+                    # edge-trusted username (C1), so a key can only be minted
+                    # for the authenticated caller. (C3)
+                    _ttl_days = 90
+                    _expires = (datetime.now(timezone.utc) + timedelta(days=_ttl_days)).isoformat()
                     create_resp = requests.post(
                         f"{authentik_api_url}/api/v3/core/tokens/",
                         headers=admin_headers,
@@ -1091,7 +1117,8 @@ elif page == "API Keys":
                             "intent": "api",
                             "user": user_pk,
                             "description": f"ISAAC Portal API key for {current_username}",
-                            "expiring": False,
+                            "expiring": True,
+                            "expires": _expires,
                         },
                         timeout=10,
                     )
@@ -1108,7 +1135,7 @@ elif page == "API Keys":
                     key_resp.raise_for_status()
                     key_value = key_resp.json()["key"]
 
-                    st.success("API key created. Copy it now — it will not be shown again.")
+                    st.success(f"API key created (expires in {_ttl_days} days). Copy it now — it will not be shown again.")
                     st.code(key_value, language="text")
                     st.markdown("**Usage:**")
                     st.code(

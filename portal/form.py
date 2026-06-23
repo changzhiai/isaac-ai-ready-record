@@ -503,9 +503,13 @@ def render_form():
                 if database.test_db_connection():
                     try:
                         try:
-                            _hdrs = st.context.headers or {}
-                            _user = _hdrs.get("X-authentik-username")
+                            _hdrs = st.context.headers
                         except Exception:
+                            _hdrs = {}
+                        # Trust the identity for write attribution only when the
+                        # request carries the edge secret (C1).
+                        _user, _ = ontology.trusted_identity(_hdrs)
+                        if _user == "anonymous":
                             _user = None
                         saved_id = database.save_record(record, uploaded_by=_user, mode="insert")
                         st.success(f"Record saved successfully! ID: {saved_id}")

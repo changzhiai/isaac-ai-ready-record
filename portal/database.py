@@ -26,6 +26,32 @@ def get_db_connection():
     )
 
 
+def get_readonly_db_connection():
+    """Connection for the untrusted free-form SQL path (nano-ISAAC,
+    /records/query).
+
+    Uses the least-privilege ``PGUSER_RO`` login role when configured — that
+    role is NOSUPERUSER with SELECT granted only on the data surface, so file
+    primitives (pg_read_file, lo_*) and audit/PII tables are unreachable (C2).
+
+    Falls back to the main connection when PGUSER_RO is unset (local dev or
+    before the role is provisioned). The fallback is still safe-ish because
+    execute_readonly_query wraps every query in a read-only transaction and
+    applies the identifier denylist — but provisioning the role is what makes
+    the superuser file-read vector truly impossible, so do it in prod."""
+    ro_user = os.environ.get('PGUSER_RO')
+    if not ro_user:
+        return get_db_connection()
+    return psycopg2.connect(
+        host=os.environ.get('PGHOST', 'localhost'),
+        port=os.environ.get('PGPORT', '5432'),
+        database=os.environ.get('PGDATABASE', 'app'),
+        user=ro_user,
+        password=os.environ.get('PGPASSWORD_RO', ''),
+        cursor_factory=RealDictCursor
+    )
+
+
 def is_db_configured():
     """Check if database environment variables are configured"""
     return bool(os.environ.get('PGHOST'))
@@ -578,11 +604,24 @@ def execute_readonly_query(sql: str, max_rows: int = 50, timeout_ms: int = 5000,
     Security:
     - Only SELECT and WITH (CTE) statements are allowed
     - Mutation keywords (INSERT, UPDATE, DELETE, DROP, ALTER, etc.) are rejected
-    - File/credential/catalog primitives are rejected (defense-in-depth; the
-      deployed `isaac` role is already NON-superuser and cannot read files)
-    - A single statement, a LIMIT, and a statement timeout are enforced
+    - A single statement only — embedded ';' is rejected
+    - System catalogs / file primitives (pg_*, information_schema, lo_*, dblink)
+      are rejected so the path cannot read server files or catalog metadata
+      (H2; defense-in-depth — the deployed `isaac` role is already NON-superuser)
+    - Runs as the least-privilege PGUSER_RO role, inside a READ ONLY transaction,
+      with a statement timeout (C2)
+    - A LIMIT clause is enforced (appended if missing)
     - agent_mode=True (nano-ISAAC): additionally restricts reads to the `records`
       table — operational/control tables are rejected by name
+
+    Args:
+        sql: The SQL query string (must be SELECT or WITH)
+        max_rows: Maximum rows to return (default 50)
+        timeout_ms: Statement timeout in milliseconds (default 5000)
+        agent_mode: If True, restrict reads to the records table (nano-ISAAC)
+
+    Returns:
+        List of row dicts from the query result
 
     Raises:
         ValueError: If the query is not a safe read-only SELECT/WITH
@@ -610,29 +649,38 @@ def execute_readonly_query(sql: str, max_rows: int = 50, timeout_ms: int = 5000,
     if re.search(forbidden, upper):
         raise ValueError("Query contains forbidden mutation keywords.")
 
-    # Defense-in-depth denylist (the real fix is the non-superuser isaac_readonly
-    # DB role — Dean/Bucket B). Until then, block the file/credential/catalog/DoS
-    # primitives that a superuser connection would otherwise expose, anywhere in
-    # the query (also catches the `WITH x AS (SELECT pg_read_file(...))` bypass).
-    blocked = r'\b(PG_READ_FILE|PG_READ_BINARY_FILE|PG_LS_DIR|PG_STAT_FILE|LO_IMPORT|LO_EXPORT|' \
-              r'PG_LARGEOBJECT|PG_AUTHID|PG_SHADOW|PG_CATALOG|INFORMATION_SCHEMA|PG_SETTINGS|' \
-              r'PG_READ_SERVER_FILES|CURRENT_SETTING|SET_CONFIG|PG_SLEEP|DBLINK|PG_STAT_ACTIVITY)\b'
-    if re.search(blocked, upper):
-        raise ValueError("Query references a restricted system function or catalog.")
+    # Reject system catalogs and server-side file/credential primitives. These
+    # are not needed to query the records/vocabulary surface, and blocking them
+    # closes the pg_read_file / lo_export / catalog-read exfiltration vectors
+    # even on the fallback (superuser) connection. The broad PG_[A-Z_]+ catch-all
+    # also blocks bare catalog reads (pg_roles, pg_class, pg_user) that an
+    # explicit list misses. (C2/H2)
+    forbidden_ident = (
+        r'\b(PG_[A-Z_]+|INFORMATION_SCHEMA|LO_IMPORT|LO_EXPORT|LO_GET|LO_PUT|'
+        r'DBLINK|CURRENT_SETTING|SET_CONFIG)\b'
+    )
+    if re.search(forbidden_ident, upper):
+        raise ValueError("Query references a forbidden system object or function.")
 
     # Enforce LIMIT if not present
     if "LIMIT" not in upper:
         stripped += f" LIMIT {max_rows}"
 
-    conn = get_db_connection()
+    conn = get_readonly_db_connection()
     cur = conn.cursor()
 
     try:
+        conn.autocommit = False
+        # READ ONLY transaction: blocks any write/DDL the checks above missed.
+        # Must be the first statement of the transaction (C2).
+        cur.execute("SET TRANSACTION READ ONLY")
         # Parameterized timeout (M4): set_config(..., is_local=true) == SET LOCAL,
         # but accepts a bound parameter so no value is f-string-interpolated.
+        # is_local=true applies it for this transaction only.
         cur.execute("SELECT set_config('statement_timeout', %s, true)", (str(int(timeout_ms)),))
         cur.execute(stripped)
         rows = cur.fetchall()
+        conn.rollback()
         return [dict(row) for row in rows]
     finally:
         cur.close()
