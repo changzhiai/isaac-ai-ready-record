@@ -71,6 +71,11 @@ if database.is_db_configured():
     _ok, _msg = ontology.sync_file_to_db()
     logger.info("Vocabulary sync on import: %s — %s", _ok, _msg)
 
+# Isolated discovery DB (discovery feature) — independent of the records DB;
+# a no-op when DISCOVERY_* is unset.
+if database.is_discovery_db_configured():
+    database.init_discovery_tables()
+
 # In-memory token cache: token -> {"user": str, "groups": list, "expires": float}
 _token_cache: dict = {}
 _TOKEN_CACHE_TTL = 300  # 5 minutes

@@ -40,6 +40,11 @@ if database.is_db_configured():
     database.init_tables()
     ontology.sync_file_to_db()
 
+# Initialize the isolated discovery DB on startup (if its env is configured).
+# Independent of the records DB above; a no-op when DISCOVERY_* is unset.
+if database.is_discovery_db_configured():
+    database.init_discovery_tables()
+
 # Check database status
 db_connected = database.test_db_connection()
 

@@ -230,6 +230,89 @@ def init_tables():
 
 
 # =============================================================================
+# Discovery feature DB (isaac_discovery)
+# =============================================================================
+# An isolated database, separate from the records DB above, backing the portal's
+# "discovery" tab. It is reached via the DISCOVERY_* env vars and the
+# least-privilege discovery_user role (owner of the isaac_discovery DB and its
+# public schema; no access to the records DB or any other DB on the cluster).
+# This is deliberately a SEPARATE connection from get_db_connection(): the two
+# DBs share a host:port (the pgbouncer pooler) but nothing else.
+
+def get_discovery_db_connection():
+    """Connection to the isolated isaac_discovery DB (discovery feature).
+
+    Reads the DISCOVERY_* env vars so it is fully independent of the records-DB
+    connection (PG*). Same psycopg2 driver and RealDictCursor convention."""
+    return psycopg2.connect(
+        host=os.environ.get('DISCOVERY_PGHOST', 'localhost'),
+        port=os.environ.get('DISCOVERY_PGPORT', '5432'),
+        database=os.environ.get('DISCOVERY_PGDATABASE', 'isaac_discovery'),
+        user=os.environ.get('DISCOVERY_PGUSER', 'discovery_user'),
+        password=os.environ.get('DISCOVERY_PGPASSWORD', ''),
+        cursor_factory=RealDictCursor
+    )
+
+
+def is_discovery_db_configured():
+    """True when the discovery DB env is present (DISCOVERY_PGHOST set).
+
+    When absent (local dev, or before the env/Secret is provisioned) the
+    discovery feature stays dormant — init is skipped and the tab can show a
+    'not configured' state rather than erroring."""
+    return bool(os.environ.get('DISCOVERY_PGHOST'))
+
+
+def test_discovery_db_connection():
+    """Test the discovery DB connection (for the tab's status / a health check)."""
+    if not is_discovery_db_configured():
+        return False
+    try:
+        conn = get_discovery_db_connection()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def init_discovery_tables():
+    """Bootstrap the isaac_discovery schema on startup (idempotent, non-fatal).
+
+    discovery_user owns the DB and its public schema, so it can create/alter its
+    own objects here. Today this only stamps a bookkeeping table that records the
+    schema version and proves DDL works end-to-end; the discovery feature's real
+    tables get added here (same CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT
+    EXISTS pattern as init_tables() above). Guarded and try/except-wrapped so it
+    never blocks pod startup if the DB is briefly unreachable during rollout."""
+    if not is_discovery_db_configured():
+        return False
+    try:
+        conn = get_discovery_db_connection()
+        cur = conn.cursor()
+        # Bookkeeping / migration marker. Single-row table keyed by a constant.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS discovery_meta (
+                id BOOLEAN PRIMARY KEY DEFAULT TRUE,
+                schema_version INT NOT NULL DEFAULT 1,
+                initialized_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT discovery_meta_singleton CHECK (id)
+            )
+        ''')
+        cur.execute('''
+            INSERT INTO discovery_meta (id) VALUES (TRUE)
+            ON CONFLICT (id) DO NOTHING
+        ''')
+        # --- discovery feature tables go here ---
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Error initializing discovery tables: {e}")
+        return False
+
+
+# =============================================================================
 # Record Operations
 # =============================================================================
 
