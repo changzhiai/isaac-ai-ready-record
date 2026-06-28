@@ -1081,9 +1081,19 @@ def discovery_access_check_batch():
         return jsonify({"error": "identity and project_ids[] are required"}), 400
     conn = database.get_discovery_db_connection()
     cur = conn.cursor()
+    out = {}
     try:
-        out = {pid: _discovery_access(identity, pid, cur=cur)
-               for pid in project_ids if isinstance(pid, str)}
+        for pid in project_ids:
+            if not isinstance(pid, str):
+                continue
+            try:
+                out[pid] = _discovery_access(identity, pid, cur=cur)
+            except Exception:
+                # One bad project_id must not 500 the whole page; reset the
+                # aborted transaction so the shared cursor stays usable, and
+                # fail closed for this entry.
+                conn.rollback()
+                out[pid] = {"exists": False, "read": False, "write": False}
     finally:
         cur.close()
         conn.close()
