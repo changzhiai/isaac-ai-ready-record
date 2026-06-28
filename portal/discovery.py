@@ -1227,9 +1227,10 @@ def get_manifest() -> dict:
                     "token you already use for these endpoints (generate it on the "
                     "portal API Keys page; no separate MLflow credential). "
                     "`pip install mlflow==3.12.0`; the client sends the token "
-                    "automatically. In-cluster runners may instead use "
-                    "http://mlflow-server.isaac-mlflow.svc.cluster.local:5050/isaac-mlflow "
-                    "tokenless.",
+                    "automatically. This one endpoint serves everyone — in-cluster "
+                    "and external callers alike go through the auth-proxy with a "
+                    "token, so per-project gating always applies (there is no "
+                    "tokenless in-cluster shortcut).",
                 "access": "Access is gated PER PROJECT, in lockstep with portal "
                     "sharing: you may read/write the experiment for a project you OWN "
                     "or that is shared with you, and no one else's. Sharing a project "

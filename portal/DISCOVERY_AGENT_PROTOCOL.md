@@ -227,8 +227,9 @@ with mlflow.start_run(run_name="turn-…"):
 experiment for a project you own or that's shared with you — and no one else's.
 Sharing a project (`POST /projects/{id}/share`) shares its traces too; a read-only
 share can view but not log. Put the resulting run URL back on the dashboard
-(`mlflow_run_url`) so the two cross-link. In-cluster runners may instead use
-`http://mlflow-server.isaac-mlflow.svc.cluster.local:5050/isaac-mlflow` tokenless.
+(`mlflow_run_url`) so the two cross-link. Everyone — in-cluster and external —
+uses this same token-authenticated endpoint; there is no tokenless in-cluster
+shortcut, so per-project access always applies.
 
 ## The invariant
 
