@@ -213,11 +213,15 @@ def init_tables():
         # metadata-only change on PG11+ (no table rewrite). content_hash backfills
         # separately (nullable). These let downstream reasoning pin & detect drift.
         cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1")
-        cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS content_hash CHAR(64)")
+        cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS content_hash VARCHAR(80)")
         cur.execute("ALTER TABLE record_history ADD COLUMN IF NOT EXISTS version INT")
-        cur.execute("ALTER TABLE record_history ADD COLUMN IF NOT EXISTS content_hash CHAR(64)")
+        cur.execute("ALTER TABLE record_history ADD COLUMN IF NOT EXISTS content_hash VARCHAR(80)")
         cur.execute("ALTER TABLE record_history ADD COLUMN IF NOT EXISTS change_note TEXT")
         cur.execute("ALTER TABLE record_history ADD COLUMN IF NOT EXISTS change_class TEXT")
+        # Widen pre-existing CHAR(64) hash columns to hold the versioned form ('v2:<hex>',
+        # 67 chars). Idempotent: a no-op once already VARCHAR(80).
+        cur.execute("ALTER TABLE records ALTER COLUMN content_hash TYPE VARCHAR(80)")
+        cur.execute("ALTER TABLE record_history ALTER COLUMN content_hash TYPE VARCHAR(80)")
 
         # Explicit co-author edit grants (keyed on Authentik username, never ORCID).
         # role is constrained to 'editor' — there is no higher tier to escalate to.
@@ -1076,24 +1080,38 @@ def record_hashes(record_ids) -> dict:
 
 
 def backfill_content_hashes(max_rows: int = 20000) -> int:
-    """One-time, idempotent: stamp content_hash on records created before versioning (rows
-    where it is NULL), so drift detection works for the existing corpus. Re-runs are no-ops.
-    Exception-safe — never blocks startup."""
+    """Idempotent: (re)stamp content_hash on records that are NULL or computed by an OLDER
+    hash-algorithm version, so drift detection works over the whole corpus. Migrates the
+    existing corpus to the current version ('v2:...') in one pass; re-runs are no-ops once
+    every row is current. Exception-safe — never blocks startup."""
     import record_provenance as _rp
     done = 0
     try:
         conn = get_db_connection(); cur = conn.cursor()
         try:
-            cur.execute("SELECT record_id, data FROM records WHERE content_hash IS NULL LIMIT %s",
-                        (max_rows,))
-            for r in cur.fetchall():
+            stale = f"{_rp._HASH_VERSION}:%"  # rows NOT matching this are NULL/legacy/older-algo
+            cur.execute("SELECT record_id FROM records "
+                        "WHERE content_hash IS NULL OR content_hash NOT LIKE %s LIMIT %s",
+                        (stale, max_rows))
+            for rid in [r["record_id"] for r in cur.fetchall()]:
                 try:
-                    h = _rp.content_hash(r["data"] or {})
-                    cur.execute("UPDATE records SET content_hash=%s "
-                                "WHERE record_id=%s AND content_hash IS NULL", (h, r["record_id"]))
+                    # Re-read the row UNDER LOCK and hash the CURRENT data, not the scan-time
+                    # snapshot: during a rolling deploy an old (v1) pod could edit the row
+                    # between the scan and the update, and stamping a stale hash would leave
+                    # content_hash describing the wrong data. FOR UPDATE serializes against
+                    # update_record_versioned's FOR UPDATE; the re-checked WHERE also skips a
+                    # row a concurrent writer already migrated.
+                    cur.execute("SELECT data FROM records WHERE record_id=%s "
+                                "AND (content_hash IS NULL OR content_hash NOT LIKE %s) FOR UPDATE",
+                                (rid, stale))
+                    locked = cur.fetchone()
+                    if locked is None:
+                        continue
+                    h = _rp.content_hash(locked["data"] or {})
+                    cur.execute("UPDATE records SET content_hash=%s WHERE record_id=%s", (h, rid))
                     done += 1
                 except Exception:
-                    logger.exception("hash backfill failed for %s", r.get("record_id"))
+                    logger.exception("hash backfill failed for %s", rid)
             conn.commit()
         finally:
             cur.close(); conn.close()
