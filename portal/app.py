@@ -38,6 +38,43 @@ if "ui_theme" not in st.session_state:
 # hamburger/theme/status/user controls all sit on ONE level.
 branding.inject_theme(st.session_state.ui_theme)
 
+components.html("""<script>
+// Auto-close popover (the menu) on Streamlit rerun
+const doc = window.parent.document;
+
+const closePopovers = () => {
+    const popoverBody = doc.querySelector('[data-testid="stPopoverBody"]');
+    if (popoverBody) {
+        // Find the trigger button (the ☰ button that opened the popover)
+        const trigger = doc.querySelector('[data-testid="stPopover"] button');
+        if (trigger) {
+            trigger.click();
+        } else {
+            doc.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', bubbles: true}));
+        }
+    }
+};
+closePopovers();
+
+if (!window.parent.__isaac_popover_listener_attached) {
+    window.parent.__isaac_popover_listener_attached = true;
+    doc.addEventListener('click', (e) => {
+        const target = e.target.closest('button, input[type="submit"], a');
+        if (target) {
+            const popover = target.closest('[data-testid="stPopoverBody"]');
+            if (popover) {
+                setTimeout(() => {
+                    const trigger = doc.querySelector('[data-testid="stPopover"] button');
+                    if (trigger) {
+                        trigger.click();
+                    }
+                }, 50);
+            }
+        }
+    });
+}
+</script>""", height=0)
+
 # Initialize database tables on startup (if configured)
 if database.is_db_configured():
     database.init_tables()
