@@ -414,6 +414,11 @@ def init_discovery_tables():
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_hyp_projects_owner '
                     'ON hyp_projects (owner_identity, updated_at DESC)')
+        # The trace contract a project was BORN under. NULL = pre-enforcement (legacy):
+        # those projects keep working exactly as before. New projects are stamped with
+        # the current version and are held to it, so improving the contract never has to
+        # be traded against preserving old demos.
+        cur.execute("ALTER TABLE hyp_projects ADD COLUMN IF NOT EXISTS policy_version INT")
         cur.execute('''
             CREATE TABLE IF NOT EXISTS hyp_hypotheses (
                 id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -483,6 +488,16 @@ def init_discovery_tables():
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_hyp_events_project '
                     'ON hyp_events (project_id, created_at DESC)')
+        # WHO reasoned (client-attested model identity) and WHY (the decision record:
+        # what was chosen, what was rejected, and on what grounds). Both nullable —
+        # every historical event keeps NULL and stays valid on read forever.
+        cur.execute("ALTER TABLE hyp_events ADD COLUMN IF NOT EXISTS actor_model JSONB")
+        cur.execute("ALTER TABLE hyp_events ADD COLUMN IF NOT EXISTS decision JSONB")
+        # policy 62: the falsification threshold as data, and the observation that met it.
+        # threshold = {comparator, value, unit} on the prediction; observed = {value, unit,
+        # scale, scale_basis} on the evaluation. Server derives margin from the pair.
+        cur.execute("ALTER TABLE hyp_predictions ADD COLUMN IF NOT EXISTS threshold JSONB")
+        cur.execute("ALTER TABLE hyp_predictions ADD COLUMN IF NOT EXISTS observed JSONB")
         # v2 (stubbed now): in-portal human<->agent chat.
         cur.execute('''
             CREATE TABLE IF NOT EXISTS hyp_messages (

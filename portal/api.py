@@ -41,6 +41,25 @@ import literature  # noqa: E402  (Edison literature gateway/proxy)
 # Flask app setup
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+
+
+@app.errorhandler(discovery.TraceContractError)
+def _trace_contract_error(e):
+    """A contract refusal is ACTIONABLE, so it must reach the agent as a 400 carrying the
+    reason, never as a 500 carrying an HTML page.
+
+    Registered app-wide rather than per-route because the per-route version was already
+    incomplete: the contract had three raise sites and one route that caught them. The 0.70
+    scale gate raised from `/evaluate`, which had no handler, so a live smoke test found the
+    refusal arriving as `500 Internal Server Error`. An agent cannot learn from that. Worse,
+    the predictable response to an unexplained 500 is to drop the field that triggered it,
+    which is precisely the failure mode the rung's own pre-registration lists as its falsifier
+    F5. Every future refusal is covered here by construction.
+    """
+    return jsonify({"error": str(e),
+                    "policy_version": discovery._tp.CURRENT_POLICY_VERSION}), 400
+
+
 # Restrict CORS to the portal origin (bearer-token API; server-to-server
 # callers like migration scripts and converters ignore CORS entirely).
 _ALLOWED_ORIGINS = os.environ.get(
@@ -1463,7 +1482,7 @@ def discovery_create_hypothesis(project_id):
         project_id, d["statement"], label=d.get("label"),
         hypothesis_type=d.get("hypothesis_type"), mechanism=d.get("mechanism"),
         origin=d.get("origin"), grounding=d.get("grounding"),
-        created_by=_disc_identity())
+        created_by=_disc_identity(), actor_model=d.get("actor_model"))
     if hid is None:
         return jsonify({"error": "project not found"}), 404
     return jsonify({"hypothesis_id": hid}), 201
@@ -1512,7 +1531,8 @@ def discovery_create_prediction(hypothesis_id):
         magnitude=d.get("magnitude"), output_quantity=d.get("output_quantity"),
         falsification_criterion=d.get("falsification_criterion"),
         discriminates=d.get("discriminates"), origin=d.get("origin"),
-        actor=_disc_identity())
+        actor=_disc_identity(), actor_model=d.get("actor_model"),
+        threshold=d.get("threshold"))
     if pid is None:
         return jsonify({"error": "hypothesis not found"}), 404
     return jsonify({"prediction_id": pid}), 201
@@ -1681,7 +1701,8 @@ def discovery_evaluate_prediction(prediction_id):
         margin=d.get("margin"), cross_system=d.get("cross_system"),
         reliability=d.get("reliability"),
         observable_key=d.get("observable_key"), literature=d.get("literature"),
-        actor=_disc_identity())
+        actor=_disc_identity(), actor_model=d.get("actor_model"),
+        observed=d.get("observed"))
     if not ok:
         return jsonify({"error": "prediction not found"}), 404
     return jsonify({"ok": True}), 200
@@ -1698,11 +1719,16 @@ def discovery_add_event(project_id):
     if etype not in discovery.EVENT_TYPES:
         return jsonify({"error": f"unknown event_type; allowed: "
                                  f"{sorted(discovery.EVENT_TYPES)}"}), 400
-    eid = discovery.add_event(
-        project_id, etype, summary, detail=d.get("detail"),
-        hypothesis_id=d.get("hypothesis_id"),
-        evidence_record_ids=d.get("evidence_record_ids"),
-        mlflow_run_url=d.get("mlflow_run_url"), actor=_disc_identity())
+    try:
+        eid = discovery.add_event(
+            project_id, etype, summary, detail=d.get("detail"),
+            hypothesis_id=d.get("hypothesis_id"),
+            evidence_record_ids=d.get("evidence_record_ids"),
+            mlflow_run_url=d.get("mlflow_run_url"), actor=_disc_identity(),
+            actor_model=d.get("actor_model"), decision=d.get("decision"))
+    except discovery.TraceContractError as e:
+        return jsonify({"error": str(e), "policy_version":
+                        discovery._tp.CURRENT_POLICY_VERSION}), 400
     if eid is None:
         return jsonify({"error": "project not found"}), 404
     return jsonify({"event_id": eid}), 201
@@ -1715,7 +1741,8 @@ def discovery_set_next_experiment(project_id):
     # REPLACE semantics: the full payload is stored (all keys preserved); send the
     # complete object each PUT.
     d = request.get_json(silent=True) or {}
-    ok = discovery.set_next_experiment(project_id, d, actor=_disc_identity())
+    ok = discovery.set_next_experiment(project_id, d, actor=_disc_identity(),
+                                       actor_model=d.get("actor_model"))
     if not ok:
         return jsonify({"error": "project not found or invalid payload"}), 404
     return jsonify({"ok": True}), 200

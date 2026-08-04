@@ -27,8 +27,15 @@ import secrets
 import time
 
 import database
+import trace_provenance as _tp
 
 logger = logging.getLogger("isaac-discovery")
+
+
+class TraceContractError(ValueError):
+    """A write rejected by the project's trace contract (policy_version). The caller
+    should surface this to the agent as a 400 with the reason text: it is actionable,
+    and the agent can retry the same write correctly."""
 
 # Crockford base32 (a subset of [0-9A-Z]); ULID-style 26-char ids, generated
 # server-side. Discovery ids are independent of records ULIDs (separate DB).
@@ -151,7 +158,45 @@ def get_manifest() -> dict:
     reasoning loop is pinned down with the practitioners."""
     return {
         "name": "ISAAC Discovery — Agent Operating Protocol",
-        "version": "0.59-provisional",
+        # `version` tracks the CONTRACT TEXT: bump whenever a clause changes in a way an
+        # agent could act on, even when nothing new is enforced. `policy_version` tracks
+        # ENFORCEMENT and bumps only when a gate is added, because it is stamped on projects
+        # for life and must not drift for a wording fix.
+        #
+        # 0.61 rewrote SIGN EVERY WRITE (actor_model belongs on the hypothesis, prediction,
+        # verdict and next_experiment paths, not only POST /events) and added
+        # provenance.who_reasoned. No new gate, so policy_version stays 60.
+        #
+        # Shipping 0.61's text under the 0.60 label would have been the real error: a
+        # reproducibility study pins the contract it measured, and two rounds run against
+        # different manifests bearing one version string are silently incomparable.
+        "version": "0.70-the-scale-is-the-records",
+        # Read from the constant, never retyped. This drifted exactly once and it was caught
+        # by an adversarial review rather than by a test: 0.70 raised CURRENT to 63 while the
+        # manifest still advertised 62, so every agent reading the contract would have been
+        # told the wrong version of the contract it is held to, and a benchmark arm would
+        # have pinned a version string that did not describe its own enforcement.
+        "policy_version": _tp.CURRENT_POLICY_VERSION,
+        "enforcement": {
+            "_what": "The trace contract is ENFORCED, not advised, for projects created at "
+                     "or after policy_version 60. A project is stamped with the contract "
+                     "it was BORN under and held to that for life; projects created "
+                     "earlier carry no stamp and are never retro-enforced. This is how "
+                     "the contract keeps improving without either breaking old work or "
+                     "diluting the rules for new work.",
+            "rejects_400": [
+                "belief-changing event with no `actor_model` (hypothesis_created, "
+                "prediction_added, prediction_evaluated, next_experiment_proposed, "
+                "status_changed, evidence_ingested, human_directive)",
+                "reasoning_step with no `decision` object"],
+            "flagged_not_rejected": [
+                "a THIN decision (`chose` with no `because` and no `rejected`) is "
+                "accepted and flagged in method_compliance. Completeness is a quality "
+                "judgement, and a hard gate on it would push you toward writing nothing "
+                "rather than something partial. Write the grounds anyway."],
+            "if_you_are_rejected": "The 400 body carries the reason and the "
+                     "policy_version. It is actionable: add the missing field and retry "
+                     "the SAME write."},
         "base_path": "https://isaac.slac.stanford.edu/portal/api",
         "isaac_ecosystem": {
             "_what": "The ISAAC tooling you should try to use. NOTHING here is assumed to "
@@ -227,6 +272,25 @@ def get_manifest() -> dict:
             "WRITE after you act: every hypothesis, prediction, verdict, status "
             "change and compute run is an API write. If it is not on the dashboard, "
             "it did not happen — never hold project state only in your context.",
+            "SIGN EVERY WRITE: put `actor_model` — {provider, model_id, model_version} — "
+            "in the BODY of every write you make, naming the model that is actually "
+            "reasoning right now, i.e. YOU. EVERY WRITE MEANS EVERY WRITE, not just "
+            "POST /events: `POST /projects/{id}/hypotheses`, `POST /hypotheses/{id}/predictions`, "
+            "`PUT /predictions/{id}` (the verdict) and `PUT /projects/{id}/next_experiment` "
+            "each take `actor_model` too, and those four ARE your science. A run that signs "
+            "only its events leaves every hypothesis and every verdict attributed to the "
+            "portal rather than to itself. Send it on every single write, not once per "
+            "project: if you hand off, resume, or are swapped mid-run, the trace must "
+            "show exactly where that happened. An unsigned write is an orphan — nobody "
+            "can later tell which model produced it, it cannot be compared across a "
+            "reproducibility set, and it is useless for training. Do not guess a model "
+            "id you are unsure of: send the fields you know and omit the rest.",
+            "SHOW THE ROAD NOT TAKEN: every `reasoning_step` MUST carry a `decision` — "
+            "{chose, rejected, because, blocked_on}. Name the alternatives you did NOT "
+            "take and WHY they lost, every time, including when the choice felt obvious. "
+            "`chose` on its own is logged but counted THIN in method_compliance. This is "
+            "the single highest-value thing you write: the outcome is recoverable from "
+            "the state, the discarded branch is recoverable from nothing.",
             "RECORD THE DIRECTIVE: if a human prompted this turn, the turn's FIRST "
             "WRITE is that prompt, copied VERBATIM into a `human_directive` event (the "
             "briefing GET is a read, so it still comes first; see "
@@ -276,7 +340,30 @@ def get_manifest() -> dict:
                 "before a record is allowed to count.",
                 "6. RENDER a verdict per prediction (supports | contradicts | neutral | "
                 "insufficient | blocked) with a strength and EXPLICIT reasoning via "
-                "/evaluate. CITE THE DATA — this is ENFORCED, not advisory: a "
+                "/evaluate. ESTABLISH THE QUANTITY BEFORE YOU RULE. It is available to you "
+                "only if (a) a cited record REPORTS the descriptor, (b) it is genuinely "
+                "DERIVABLE from what the records report, or (c) a compute run supplies it. "
+                "Otherwise the prediction is undecidable and the honest verdict is "
+                "'insufficient', or a submitted calculation. "
+                "⚠ READ THE `definition` STRING BEFORE TREATING A TOTAL AS A CONSTRAINT. A "
+                "sum-of-reported-channels is an IDENTITY, not a closure: if "
+                "total_faradaic_efficiency is defined as 'sum of all measured product FEs "
+                "(H2 + CO)', then reported-FEs equalling that total tells you NOTHING about "
+                "an unmeasured product — it closes by construction, on every record, always. "
+                "A real bound needs an INDEPENDENT charge balance, or evidence that the "
+                "analysis actually covered the product class you are asking about: check "
+                "measurement.processing.steps and measurement.series.channels. A record "
+                "analysed by GC alone cannot bound a liquid product, however tidily its total "
+                "reads. THIS EXACT FALLACY was shipped in an earlier version of this clause "
+                "and had to be withdrawn. "
+                "Do not invent a value, and do not manufacture a bound out of a definition. "
+                "Equally, do not retreat to 'insufficient' when the records really do settle "
+                "the question. SAY WHICH ROUTE YOU USED in the rationale, and if you rely on "
+                "a conservation argument, state the measurement that makes it a constraint. "
+                "The briefing reports "
+                "method_compliance.decisive_verdict_without_descriptor_in_evidence when a "
+                "decisive verdict cites nothing that reports the quantity. "
+                "CITE THE DATA — this is ENFORCED, not advisory: a "
                 "supports/contradicts MUST attach the evidence_record_ids it rests on "
                 "AND/OR the compute_run that grounds it. Even when you derived a proxy by "
                 "computing over RAW records (e.g. a product slate from GC ppm), cite THOSE "
@@ -494,7 +581,33 @@ def get_manifest() -> dict:
                 "EXCLUDED (schema gate, below). strength = strong 1.0 / moderate 0.6 / "
                 "weak 0.3 (an OMITTED strength is treated as weak — qualify your "
                 "decisive verdicts). confidence = sigmoid(Σ). A new hypothesis starts at "
-                "the 0.5 prior.",
+                "the 0.5 prior. "
+                "⚠ FOR PROJECTS BORN AT policy_version >= 61 THE TIER IS DERIVED BY THE "
+                "SERVER, not authored: no rival contrast in the prediction's "
+                "`discriminates` -> weak (regardless of effect size); rival contrast with "
+                "margin >= 0.5 or omitted -> strong; rival contrast with margin < 0.5 -> "
+                "moderate. Your authored `strength` is recorded verbatim as your CLAIM and "
+                "compared, but it no longer moves the score — populate `discriminates` "
+                "with EVERY rival's expected outcome and put your decisiveness in `margin` "
+                "with its basis in the rationale; those are the inputs that count. This "
+                "extends the platform's founding rule — confidence is computed, never "
+                "authored — one level down, after measurement showed a prose rubric moves "
+                "models in the right direction but cannot remove per-model variance. "
+                "⚠ STRENGTH ANSWERS EXACTLY ONE QUESTION, and it is NOT 'how big is the "
+                "effect'. Decide it in two steps. STEP 1 — RIVAL CONTRAST: does at least "
+                "one RIVAL hypothesis predict a DIFFERENT outcome for this observable "
+                "(consult and populate the prediction's `discriminates`)? If NO rival "
+                "predicts otherwise, the verdict is 'weak' REGARDLESS of effect size: a "
+                "large effect every rival also predicts is consistency, not support. "
+                "STEP 2 — only if a rival contrast exists, set the tier by how decisively "
+                "the observation separates the rivals, and quantify that in `margin`, "
+                "stating its basis in the rationale (observed value, threshold, and the "
+                "scatter or uncertainty it is judged against). A 20-fold effect that every "
+                "rival predicts is 'weak'; a 2-fold effect that only one hypothesis "
+                "survives is 'strong'. When you claim 'strong', NAME the rival that "
+                "predicted otherwise in the rationale. The briefing reports "
+                "method_compliance.strong_verdict_without_rival_contrast when a 'strong' "
+                "sits on a prediction whose `discriminates` names no differing rival.",
             "schema_gate": "When evidence is NOT validly comparable to a prediction "
                 "(different output_quantity, units without a declared transform, "
                 "different functional / electrolyte / potential / reference state, a DFT "
@@ -549,7 +662,19 @@ def get_manifest() -> dict:
                 "strong-contradiction falsification cap: a STRONG contradiction only counts "
                 "as a kill (≤0.15) when the breach is decisive (margin omitted or ≥0.5) — a "
                 "barely-past-threshold strong contradiction is strong evidence-against, not "
-                "an automatic falsification. Omit margin and the strength tier alone is used.",
+                "an automatic falsification. Omit margin and the strength tier alone is used. "
+                "⚠ FOR PROJECTS BORN AT policy_version >= 62 THE MARGIN IS DERIVED when the "
+                "structured inputs exist: register the prediction's falsification threshold "
+                "as DATA — `threshold: {comparator, value, unit}` (this also expresses "
+                "one-sided predictions like 'does not fall below X' that the direction enum "
+                "cannot) — and declare on /evaluate what you OBSERVED: `observed: {value, "
+                "unit, scale, scale_basis}`, where scale is the measured scatter or "
+                "uncertainty the divergence is judged against, with the records it comes "
+                "from. The server computes margin = min(1, |observed − threshold| / (3 × "
+                "scale)): three-sigma-out is fully decisive, at-the-line is zero. Your "
+                "authored margin stays recorded as your claim. Units must match or the "
+                "derivation refuses. Declare numbers you can cite, not numbers you like — "
+                "observed and scale are checkable against the records you pin. The SCALE IS THE EVIDENCE'S, not yours: where the records you cite declare an uncertainty, use it (a two-sample difference resolves at sqrt(2) x sigma), and never offer the prediction's own threshold as the scale — a decision line says where the answer changes, a scale says how well you can see. Both are refused with the value the records support.",
             "reliability": "How much to TRUST the datum itself — distinct from "
                 "method-compatibility (is it comparable?) and strength (how decisive?). "
                 "Optionally pass `reliability:{basis:{reproduced_by:[ids], conflicts_with:"
@@ -982,7 +1107,9 @@ def get_manifest() -> dict:
             "GET /briefing", "reason", "write each move (hypotheses/predictions/"
             "evaluate/status)",
             "POST /events per step — including event_type='reasoning_step' to record the "
-            "WHY (not just the state change), so a future resume inherits your thinking",
+            "WHY (not just the state change), so a future resume inherits your thinking. "
+            "EVERY event carries `actor_model` (who is reasoning); every reasoning_step "
+            "also carries `decision` {chose, rejected, because, blocked_on}",
             "PUT /next_experiment"],
         "compute_loop": [
             "FIRST query isaac_data_sources (+ literature) for an EXISTING value — don't "
@@ -998,6 +1125,34 @@ def get_manifest() -> dict:
             "PUT ... {work_status:'compute_running'} when it starts",
             "PUT /predictions/{id}/evaluate with verdict + evidence + final mlflow_run_url"],
         "field_shapes": {
+            "actor_model": {"_for": "WHO reasoned. Send on every belief-changing event "
+                       "(and ideally on reasoning_step too). A multi-account or "
+                       "multi-model run is UNINTERPRETABLE without it, and a trace with "
+                       "no model attached cannot be compared, reproduced or reused.",
+                       "provider": "str? e.g. anthropic | openai | xai | google",
+                       "model_id": "str? the model you are, e.g. claude-opus-5",
+                       "model_version": "str? snapshot/date pin if you have one",
+                       "harness": "str? the agent framework you run inside",
+                       "harness_version": "str?",
+                       "identity_trust": "SERVER-SET, never yours. Always "
+                       "'client_attested': the portal verifies your PRINCIPAL from the "
+                       "Bearer token, but it cannot verify which model you are. Sending "
+                       "this field does nothing — it is overwritten. Nothing in ISAAC "
+                       "will present your model claim as cryptographically verified."},
+            "decision": {"_for": "WHY. Attach to reasoning_step (and any event where a "
+                       "choice was made). The state change alone is not a trace: the "
+                       "branch you REJECTED is usually the informative one, and it is "
+                       "the part a later reader — or a model being trained on this — "
+                       "cannot reconstruct from the outcome.",
+                       "chose": "str — what you decided to do",
+                       "rejected": "[str] — the alternatives you considered and did NOT "
+                       "take. Name them even when the choice felt obvious.",
+                       "because": "[str] — the grounds. What made the chosen option win "
+                       "and the others lose.",
+                       "blocked_on": "[str]? — what stops you going further right now.",
+                       "_complete": "chose + (because OR rejected). A bare `chose` is "
+                       "recorded but flagged thin in method_compliance. `blocked_on` "
+                       "alone is a stall, not a decision."},
             "prediction": {"_for": "a hypothesis carries a SET of these (>=2, aim 3-4), "
                        "spanning DIFFERENT measurables — each STRUCTURED into discrete "
                        "fields, not a claim packed into descriptor_name with a prose "
@@ -1102,6 +1257,45 @@ def get_manifest() -> dict:
                                 "change_note": "str",
                                 "change_type": "refinement|reparameterization|rewording"},
         },
+        "provenance": {
+            "_what": "How ISAAC binds a verdict to the EXACT evidence it rested on. This "
+                     "is already enforced server-side; you get it for free, but only if "
+                     "you CITE. It is the reason a ranking from last year can still be "
+                     "audited today.",
+            "who_reasoned": "Provenance answers TWO questions: which evidence a verdict "
+                     "rested on, and WHICH MODEL produced it. The second is `actor_model`, "
+                     "and it is accepted in the body of every scientific write, not only "
+                     "POST /events: hypotheses, predictions, verdicts and next_experiment "
+                     "all take it. Omit it there and the row is signed by the PORTAL, which "
+                     "records the platform as the author of your reasoning. The briefing "
+                     "reports that as method_compliance.agent_actions_signed_by_portal_count "
+                     "— it is tracked separately from `unattributed` because the field is "
+                     "populated, just with the wrong actor, so it will not show up as a "
+                     "missing-field gap. Model identity is `client_attested`: the portal "
+                     "records what you claim and never presents it as verified.",
+            "cite_to_bind": "Citing evidence_record_ids on /evaluate is what activates "
+                     "provenance. The server PINS each cited record at evaluate-time — "
+                     "{record_id, version, content_hash} — so the verdict is anchored to "
+                     "the exact content it read. An uncited verdict has nothing to bind "
+                     "and, per scoring_model, earns no standing either.",
+            "content_hash": "Records are versioned and content-hashed over the SCIENTIFIC "
+                     "blocks only (sample, system, context, measurement, descriptors, "
+                     "computation, links, assets). Ownership, tags, timestamps and "
+                     "routing are EXCLUDED, and assets hash by CHECKSUM rather than URI, "
+                     "so a re-host or a re-tag is cosmetic by construction. The hash "
+                     "carries an algorithm version, and only same-version hashes are "
+                     "compared.",
+            "evidence_drift": "If a cited record is MATERIALLY edited after you used it, "
+                     "the briefing raises evidence_drift naming the prediction and the "
+                     "record. It NEVER moves a score — it asks you to re-examine. "
+                     "Re-evaluating re-pins, and the warning self-clears.",
+            "records_vs_projects": "Two separate stores. The ISAAC RECORD repository is "
+                     "shared: every agent reads the same corpus, and that is the point. "
+                     "Discovery PROJECTS are private to their owner and whoever they are "
+                     "explicitly shared with — hypotheses, predictions, verdicts and the "
+                     "whole reasoning trace. A blinded replicate is isolated at the "
+                     "project layer while still standing on the common evidence base."
+        },
         "auditability": "Record EVERY decision point in BOTH places (dual-write): "
             "(1) POST an `event` to the dashboard with a `detail` carrying the full "
             "reasoning — this is canonical and drives the briefing; (2) mirror the same "
@@ -1114,7 +1308,13 @@ def get_manifest() -> dict:
             "Human prompts are provenance too: the verbatim directive that opens a "
             "human-prompted turn is its FIRST write, a `human_directive` event "
             "(self-reported, dashboard-only). The briefing flags substantial activity "
-            "with no directive on record.",
+            "with no directive on record. "
+            "WHO AND WHY: every belief-changing event should carry `actor_model` (which "
+            "model reasoned) and every reasoning_step a `decision` ({chose, rejected, "
+            "because, blocked_on}) — see field_shapes. Recording only what you did, and "
+            "never what you ruled out or why, yields a log rather than a trace: the "
+            "rejected branch is the part no later reader can reconstruct from the "
+            "outcome. method_compliance flags unattributed writes and thin decisions.",
         "integrations": {
             "isaac_data_sources": {
                 "purpose": "ISAAC is itself a primary KNOWLEDGE SOURCE — query it BEFORE "
@@ -1389,15 +1589,30 @@ def _verified_literature(p):
 
 def _append_event(cur, project_id, event_type, summary, *, detail=None,
                   hypothesis_id=None, evidence_record_ids=None,
-                  mlflow_run_url=None, actor=None):
-    """Insert one activity-feed row. Caller owns the transaction/commit."""
+                  mlflow_run_url=None, actor=None, actor_model=None, decision=None,
+                  server_write=True):
+    """Insert one activity-feed row. Caller owns the transaction/commit.
+
+    `actor_model` (WHO reasoned) and `decision` (WHY, incl. the rejected branch) are
+    normalized here and stored as JSONB. Both are optional: every existing caller and
+    every historical row simply carries NULL."""
+    # Server-originated writes sign themselves. The CLIENT path (add_event) passes
+    # server_write=False, so an unsigned agent write is NEVER mislabelled as the portal's
+    # — it is either rejected by the policy gate or recorded honestly as unattributed.
+    if server_write and actor_model is None:
+        actor_model = _tp.SERVER_ACTOR
+    _am = _tp.normalize_actor_model(actor_model)
+    _dec = _tp.normalize_decision(decision)
     cur.execute(
         """INSERT INTO hyp_events
              (project_id, hypothesis_id, event_type, summary, detail,
-              evidence_record_ids, mlflow_run_url, actor_identity)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+              evidence_record_ids, mlflow_run_url, actor_identity,
+              actor_model, decision)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (project_id, hypothesis_id, event_type, summary, detail,
-         evidence_record_ids, mlflow_run_url, actor))
+         evidence_record_ids, mlflow_run_url, actor,
+         json.dumps(_am) if _am else None,
+         json.dumps(_dec) if _dec else None))
     return cur.fetchone()["id"]
 
 
@@ -1488,9 +1703,13 @@ def create_project(owner_identity, title, goal=None, material_system=None,
         project_id = new_ulid()
         cur.execute(
             """INSERT INTO hyp_projects
-                 (project_id, owner_identity, title, goal, material_system, reaction)
-               VALUES (%s,%s,%s,%s,%s,%s)""",
-            (project_id, owner_identity, title, goal, material_system, reaction))
+                 (project_id, owner_identity, title, goal, material_system, reaction,
+                  policy_version)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (project_id, owner_identity, title, goal, material_system, reaction,
+             _tp.CURRENT_POLICY_VERSION))
+        # project_created is itself belief-changing; the server signs its own write so a
+        # brand-new project does not open with an unattributed event it cannot fix.
         _append_event(cur, project_id, "project_created",
                       f"Project created: {title}", actor=owner_identity)
         conn.commit()
@@ -1662,7 +1881,7 @@ def get_project(project_id, owner_identity=None) -> dict | None:
         conn.close()
 
 
-def set_next_experiment(project_id, payload, actor=None) -> bool:
+def set_next_experiment(project_id, payload, actor=None, actor_model=None) -> bool:
     """REPLACE the project's next_experiment with the full payload the agent
     sends — ALL keys preserved (no silent drop), plus a server proposed_at. PUT
     is replace-not-merge: send the complete object each time."""
@@ -1683,7 +1902,8 @@ def set_next_experiment(project_id, payload, actor=None) -> bool:
         _append_event(cur, project_id, "next_experiment_proposed",
                       f"Next experiment proposed: {desc} "
                       f"({payload.get('method', '')} @ {payload.get('facility', '')})",
-                      detail=payload.get("rationale"), actor=actor)
+                      detail=payload.get("rationale"), actor=actor,
+                      actor_model=actor_model, server_write=actor_model is None)
         conn.commit()
         return True
     finally:
@@ -1708,7 +1928,7 @@ def _snapshot_confidence(cur, project_id, hypothesis_id, confidence, *,
 
 def create_hypothesis(project_id, statement, *, label=None, hypothesis_type=None,
                       mechanism=None, origin=None, grounding=None,
-                      created_by=None) -> str | None:
+                      created_by=None, actor_model=None) -> str | None:
     conn = _conn()
     cur = conn.cursor()
     try:
@@ -1726,10 +1946,13 @@ def create_hypothesis(project_id, statement, *, label=None, hypothesis_type=None
              json.dumps(origin) if origin is not None else None,
              normalize_grounding(grounding) if grounding is not None else None,
              0.5, created_by))
+        # server_write=False when the agent attested itself, so its signature is kept
+        # verbatim instead of being overwritten with the portal's.
         _append_event(cur, project_id, "hypothesis_created",
                       f"Hypothesis {label or ''} added: {statement[:120]}",
                       detail=_decision_why(origin, mechanism),
-                      hypothesis_id=hypothesis_id, actor=created_by)
+                      hypothesis_id=hypothesis_id, actor=created_by,
+                      actor_model=actor_model, server_write=actor_model is None)
         # born at the 0.5 PRIOR (no evidence yet); evidence moves it via evaluate
         _snapshot_confidence(cur, project_id, hypothesis_id, 0.5, source="created")
         cur.execute("UPDATE hyp_projects SET updated_at=NOW() WHERE project_id=%s",
@@ -1776,7 +1999,7 @@ def update_hypothesis(hypothesis_id, *, status=None, reason=None, actor=None, **
 def create_prediction(hypothesis_id, descriptor_name, *, label=None, direction=None,
                       reference_condition=None, magnitude=None, output_quantity=None,
                       falsification_criterion=None, discriminates=None, origin=None,
-                      actor=None) -> str | None:
+                      actor=None, actor_model=None, threshold=None) -> str | None:
     conn = _conn()
     cur = conn.cursor()
     try:
@@ -1809,15 +2032,17 @@ def create_prediction(hypothesis_id, descriptor_name, *, label=None, direction=N
             """INSERT INTO hyp_predictions
                  (prediction_id, hypothesis_id, label, descriptor_name, direction,
                   reference_condition, magnitude, output_quantity,
-                  falsification_criterion, discriminates, origin)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                  falsification_criterion, discriminates, origin, threshold)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (prediction_id, hypothesis_id, label, descriptor_name, direction,
              reference_condition, magnitude, output_quantity, falsification_criterion,
              json.dumps(discriminates) if discriminates is not None else None,
-             json.dumps(origin) if origin is not None else None))
+             json.dumps(origin) if origin is not None else None,
+             json.dumps(threshold) if threshold is not None else None))
         _append_event(cur, project_id, "prediction_added",
                       f"Prediction added: {descriptor_name} ({direction or '?'})",
-                      detail=_decision_why(origin), hypothesis_id=hypothesis_id, actor=actor)
+                      detail=_decision_why(origin), hypothesis_id=hypothesis_id, actor=actor,
+                      actor_model=actor_model, server_write=actor_model is None)
         conn.commit()
         return prediction_id
     finally:
@@ -1829,7 +2054,8 @@ def evaluate_prediction(prediction_id, verdict, *, strength=None,
                         evidence_record_ids=None, rationale=None,
                         mlflow_run_url=None, evidence_independence=None,
                         margin=None, cross_system=None, reliability=None,
-                        observable_key=None, literature=None, actor=None) -> bool:
+                        observable_key=None, literature=None, actor=None,
+                        actor_model=None, observed=None) -> bool:
     """Terminal verdict on a prediction. `evidence_independence` declares
     USE-NOVELTY: which evidence was used to BUILD/fit the supporting model vs to
     TEST it. {model_was_fit:bool, parameters_fit_to:[id], tested_against:[id],
@@ -1892,14 +2118,29 @@ def evaluate_prediction(prediction_id, verdict, *, strength=None,
     cur = conn.cursor()
     try:
         cur.execute(
-            """SELECT p.hypothesis_id, h.project_id, p.descriptor_name
+            """SELECT p.hypothesis_id, h.project_id, p.descriptor_name, p.threshold,
+                      pr.policy_version
                  FROM hyp_predictions p
                  JOIN hyp_hypotheses h ON h.hypothesis_id = p.hypothesis_id
+                 LEFT JOIN hyp_projects pr ON pr.project_id = h.project_id
                 WHERE p.prediction_id = %s""",
             (prediction_id,))
         row = cur.fetchone()
         if row is None:
             return False
+        # POLICY 63: the scale the margin divides by must be the evidence's own. Binds only
+        # for projects born at or after 63, so no archived project's confidence can move.
+        if int(row.get("policy_version") or 0) >= _tp.POLICY_OBSERVED_SCALE:
+            _th = row.get("threshold")
+            if isinstance(_th, str):
+                try:
+                    _th = json.loads(_th)
+                except Exception:
+                    _th = None
+            _why = _check_observed_scale(observed, _th, row.get("descriptor_name"),
+                                         evidence_record_ids)
+            if _why:
+                raise TraceContractError(_why)
         # Pin the cited evidence at evaluate-time so a later MATERIAL edit can be flagged
         # (drift). Re-evaluating re-pins -> the warning self-clears.
         _pins = _pin_evidence(evidence_record_ids)
@@ -1909,7 +2150,7 @@ def evaluate_prediction(prediction_id, verdict, *, strength=None,
                       rationale=%s, mlflow_run_url=%s, evidence_independence=%s,
                       margin=%s, cross_system=%s, reliability_tier=%s,
                       reliability_basis=%s, observable_key=%s, literature=%s,
-                      evidence_pins=%s, work_status='evaluated', updated_at=NOW()
+                      evidence_pins=%s, observed=%s, work_status='evaluated', updated_at=NOW()
                 WHERE prediction_id=%s""",
             (verdict, strength, evidence_record_ids, rationale, mlflow_run_url,
              json.dumps(evidence_independence) if evidence_independence is not None
@@ -1920,6 +2161,7 @@ def evaluate_prediction(prediction_id, verdict, *, strength=None,
              (observable_key or None),
              json.dumps(lit_clean) if lit_clean is not None else None,
              json.dumps(_pins) if _pins else None,
+             json.dumps(observed) if observed is not None else None,
              prediction_id))
         _circ = _circularity_flag(evidence_independence)
         _detail = rationale
@@ -1931,7 +2173,8 @@ def evaluate_prediction(prediction_id, verdict, *, strength=None,
                       f"{verdict} ({strength or '?'})",
                       detail=_detail, hypothesis_id=row["hypothesis_id"],
                       evidence_record_ids=evidence_record_ids,
-                      mlflow_run_url=mlflow_run_url, actor=actor)
+                      mlflow_run_url=mlflow_run_url, actor=actor,
+                      actor_model=actor_model, server_write=actor_model is None)
         # CANONICAL: confidence is recomputed from the verdicts and stored here —
         # this is the ONLY thing that moves a hypothesis's confidence.
         _recompute_and_store_confidence(cur, row["hypothesis_id"], actor=actor)
@@ -2399,6 +2642,181 @@ def _evidence_key(p):
     return frozenset(base | set(_calc_keys(p)))
 
 
+def _derived_strength(pred, own_label=None):
+    """Policy-61 scoring tier, DERIVED from declared, checkable inputs — never authored.
+
+    "Confidence is computed, never authored" extended one level down, and each step of the
+    ladder was measured before this was built: a prose rubric moved five models' strength
+    choices in the predicted direction but could not shrink variance (its application is
+    itself a judgement); enriching `discriminates` with every rival's expectation raised
+    agreement (modal 0.54 -> 0.67) but left 0.13-0.21 of confidence spread. The tier is the
+    last authored adjective in the scoring path, so it becomes a pure function:
+
+        no rival contrast on the record            -> weak
+        rival contrast, margin >= 0.5 or omitted   -> strong
+        rival contrast, margin < 0.5               -> moderate
+
+    A rival contrast means the prediction's `discriminates` names at least one hypothesis
+    OTHER than its own, with a stated expected outcome. Magnitude without discrimination
+    stays weak regardless of effect size. The authored `strength` remains recorded verbatim
+    as the agent's CLAIM (free comparison analytics between claim and derivation), but for
+    projects born at policy >= 61 it no longer moves the score.
+    """
+    disc = pred.get("discriminates")
+    if isinstance(disc, str):
+        try:
+            disc = json.loads(disc)
+        except Exception:
+            disc = None
+    rivals = False
+    for d in (disc or []):
+        if isinstance(d, dict) and d.get("hypothesis_label") and d.get("expected") \
+                and d.get("hypothesis_label") != own_label:
+            rivals = True
+            break
+    if not rivals:
+        return "weak"
+    m = pred.get("margin")
+    try:
+        m = None if m is None else float(m)
+    except (TypeError, ValueError):
+        m = None
+    return "strong" if (m is None or m >= 0.5) else "moderate"
+
+
+def _descriptor_sigmas(descriptor_name, record_ids):
+    """Declared sigma for one descriptor across the cited records (read-only cross-DB
+    lookup into the records store). Returns [] when nothing is declared, which is the
+    common case for digitized literature and is treated as "the evidence has no opinion",
+    never as sigma = 0."""
+    out = []
+    for rec in (database.get_records_batch(list(record_ids)) or []):
+        for blk in ((rec.get("descriptors") or {}).get("outputs") or []):
+            for d in (blk.get("descriptors") or []):
+                if d.get("name") != descriptor_name:
+                    continue
+                unc = d.get("uncertainty") or {}
+                try:
+                    sig = float(unc.get("sigma"))
+                except (TypeError, ValueError):
+                    continue
+                if sig > 0:
+                    out.append(sig)
+    return out
+
+
+def _declared_scale(descriptor_name, record_ids):
+    """The noise scale the EVIDENCE declares for this descriptor, or None.
+
+    Policy 63. The margin divides by a scale, so whoever picks the scale picks the answer:
+    measured on the 0.69 arm, four agents recorded the SAME observation on the SAME records
+    with the SAME verdict and, differing only in the scale they declared (0.015 to 0.057),
+    split 0.150 against 0.709 on the hypothesis. Three of the four could have read the scale
+    off the records they had already cited.
+
+    Rule: a two-sample difference is resolved at sqrt(2) * sigma; a single value at sigma.
+    Returns {"value", "basis", "n_records", "kind"} or None when the evidence declares
+    nothing, in which case the agent's own scale stands (with its basis, per 0.69).
+    """
+    if not descriptor_name or not record_ids:
+        return None
+    try:
+        sigmas = _descriptor_sigmas(descriptor_name, record_ids)
+    except Exception:
+        logger.warning("declared-scale lookup failed", exc_info=True)
+        return None
+    if not sigmas:
+        return None
+    sig = max(sigmas)                     # conservative: the loosest declaration binds
+    if sig <= 0:
+        return None
+    two_sample = len(sigmas) > 1
+    val = sig * (2 ** 0.5) if two_sample else sig
+    return {"value": val, "n_records": len(sigmas), "kind": "difference" if two_sample else "value",
+            "basis": ("sqrt(2) x sigma=%g declared on the %d cited records for %s"
+                      % (sig, len(sigmas), descriptor_name)) if two_sample else
+                     ("sigma=%g declared on the cited record for %s" % (sig, descriptor_name))}
+
+
+def _check_observed_scale(observed, threshold, descriptor_name, record_ids):
+    """Refuse a scale that is not the evidence's. Returns None when the write is fine,
+    else the reason text for a 400.
+
+    Two refusals, both narrow and both actionable:
+      1. the prediction's own THRESHOLD offered as the scale. A decision line is not a noise
+         scale, and using it makes a decisive contradiction go soft exactly when it matters.
+      2. a scale that disagrees with the evidence's declared uncertainty by more than 2x, in
+         either direction. Two-fold is deliberately loose: it catches conflation and the
+         difference-as-its-own-scale mistake, and leaves honest derivations (sigma vs
+         sqrt(2)*sigma vs 2*sigma) alone.
+    """
+    if not isinstance(observed, dict):
+        return None
+    try:
+        scale = float(observed.get("scale"))
+    except (TypeError, ValueError):
+        return None
+    if scale <= 0:
+        return None
+    if isinstance(threshold, dict):
+        try:
+            tv = float(threshold.get("value"))
+        except (TypeError, ValueError):
+            tv = None
+        if tv is not None and tv != 0 and abs(scale - abs(tv)) <= 1e-12 * max(1.0, abs(tv)):
+            return ("`observed.scale` equals this prediction's registered threshold (%g). A "
+                    "decision line is not a noise scale: the threshold says where the answer "
+                    "changes, the scale says how well you can see. Declare the scatter of the "
+                    "quantity you measured, and say in `scale_basis` which record field or "
+                    "derivation it came from." % tv)
+    dec = _declared_scale(descriptor_name, record_ids)
+    if dec and (scale > 2.0 * dec["value"] or scale < 0.5 * dec["value"]):
+        return ("`observed.scale` %g disagrees with the uncertainty the cited evidence "
+                "declares by more than a factor of two: %s gives %g. Use the evidence's own "
+                "scale, or cite records whose declared uncertainty supports the one you want."
+                % (scale, dec["basis"], dec["value"]))
+    return None
+
+
+def _derived_margin(pred):
+    """Policy-62 sharpness, DERIVED from the structured threshold and the declared
+    observation — the last authored number in the scoring path pushed down to auditable
+    physical quantities.
+
+    Ordered by the 0.67 arm: with tiers computed, ALL remaining confidence variance was
+    authored-margin variance, and a single 0.4 margin toggled the falsification cap and broke
+    the programme's first 0.000 panel spread. The [0,1] feeling becomes arithmetic:
+
+        margin = min(1, |observed - threshold| / (3 * scale))
+
+    Three-sigma-out is fully decisive; at the line is zero. Units must match (declared, not
+    converted). Returns None when either side is missing or malformed — the caller falls back
+    to the authored margin (pre-62 behaviour), so the function is additive by construction.
+    Authorship is not eliminated: observed/scale are declared BY the agent WITH citations,
+    checkable against the cited records — the same move that computed the tier.
+    """
+    def _load(v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return None
+        return v
+    th, ob = _load(pred.get("threshold")), _load(pred.get("observed"))
+    if not (isinstance(th, dict) and isinstance(ob, dict)):
+        return None
+    try:
+        t, o = float(th.get("value")), float(ob.get("value"))
+        scale = float(ob.get("scale"))
+    except (TypeError, ValueError):
+        return None
+    if scale <= 0:
+        return None
+    if th.get("unit") and ob.get("unit") and th["unit"] != ob["unit"]:
+        return None                      # unit mismatch: refuse rather than guess
+    return min(1.0, abs(o - t) / (3.0 * scale))
+
+
 def _margin_factor(margin):
     """Per-verdict SHARPNESS multiplier. margin ∈ [0,1] = how decisively the
     observation diverged past the falsification threshold (1 = far past, 0 = right at
@@ -2495,6 +2913,11 @@ def compute_hypothesis_score(h) -> dict:
           "cross_system_attenuated": 0, "low_reliability_excluded": 0, "uncited_excluded": 0,
           "unfalsifiable_excluded": 0, "unstructured_excluded": 0, "unexplained_excluded": 0}
     hyp_grounding = _grounding(h)   # gates the accommodation discount (standing_prior vs ad_hoc)
+    try:
+        _use_derived = int(h.get("policy_version") or 0) >= _tp.POLICY_DERIVED_STRENGTH
+        _use_derived_margin = int(h.get("policy_version") or 0) >= _tp.POLICY_DERIVED_MARGIN
+    except (TypeError, ValueError):
+        _use_derived = _use_derived_margin = False
     logit = 0.0
     decisive = []   # (direction, strength_weight, evidence_key, margin, cross_system)
     # Per-prediction admissibility, surfaced so the UI can show WHY a verdict isn't
@@ -2507,8 +2930,17 @@ def compute_hypothesis_score(h) -> dict:
         v = normalize_verdict(p.get("verdict"))
         # omitted/unknown strength → weak (the conservative tier): an unqualified
         # verdict should move belief the LEAST, never a magic mid-value.
-        sw = _STRENGTH_W.get((p.get("strength") or "").strip().lower(), _STRENGTH_W["weak"])
+        # Policy >= 61: the tier is DERIVED from rival-contrast + margin (see
+        # _derived_strength); the authored value stays recorded as the claim only.
+        if _use_derived:
+            sw = _STRENGTH_W[_derived_strength(p, h.get("label"))]
+        else:
+            sw = _STRENGTH_W.get((p.get("strength") or "").strip().lower(), _STRENGTH_W["weak"])
         _m = p.get("margin")
+        if _use_derived_margin:
+            _dm = _derived_margin(p)
+            if _dm is not None:
+                _m = _dm            # authored margin remains recorded as the claim
         _xsys = bool(p.get("cross_system"))   # evidence from a DIFFERENT system/mechanism class
         _rel = p.get("reliability_tier")      # server-derived trust tier (None = opt-out, as-today)
         # OBSERVABLE for robustness-dedup: an explicit observable_key, else the calc
@@ -2749,7 +3181,7 @@ def _recompute_and_store_confidence(cur, hypothesis_id, *, actor=None) -> float:
                           evidence_independence, evidence_record_ids, margin,
                           cross_system, reliability_tier, observable_key,
                           falsification_criterion, direction, reference_condition,
-                          rationale, literature
+                          rationale, literature, discriminates, threshold, observed
                      FROM hyp_predictions WHERE hypothesis_id=%s
                      ORDER BY prediction_id""", (hypothesis_id,))
     preds = [dict(r) for r in cur.fetchall()]
@@ -2761,13 +3193,22 @@ def _recompute_and_store_confidence(cur, hypothesis_id, *, actor=None) -> float:
         cur.execute("""SELECT mlflow_run_url, slurm_job_id FROM hyp_compute_runs
                          WHERE prediction_id=%s""", (p["prediction_id"],))
         p["compute_runs"] = [dict(r) for r in cur.fetchall()]
-    cur.execute("SELECT project_id, grounding FROM hyp_hypotheses WHERE hypothesis_id=%s",
+    cur.execute("SELECT project_id, grounding, label FROM hyp_hypotheses WHERE hypothesis_id=%s",
                 (hypothesis_id,))
     row = cur.fetchone()
-    # grounding gates the accommodation discount — it must reach the scorer so the
-    # STORED confidence reflects it (not just the display path).
+    # grounding gates the accommodation discount; label + policy_version reach the scorer
+    # because policy>=61 derives the strength tier from the prediction's rival-contrast
+    # structure, and "rival" is defined relative to the OWN hypothesis's label.
+    _pv = None
+    if row:
+        cur.execute("SELECT policy_version FROM hyp_projects WHERE project_id=%s",
+                    (row["project_id"],))
+        _prow = cur.fetchone()
+        _pv = _prow.get("policy_version") if _prow else None
     score = compute_hypothesis_score({"predictions": preds,
-                                      "grounding": row["grounding"] if row else None})
+                                      "grounding": row["grounding"] if row else None,
+                                      "label": row["label"] if row else None,
+                                      "policy_version": _pv})
     conf = score["computed_confidence"]
     if row is None:
         return conf
@@ -2794,6 +3235,191 @@ def _pin_evidence(evidence_record_ids):
             pins.append({"record_id": rid, "version": vh.get("version"),
                          "content_hash": vh.get("content_hash")})
     return pins
+
+
+_TRACE_AUDIT_WINDOW = 500
+
+
+def _events_for_trace(project_id, limit=_TRACE_AUDIT_WINDOW):
+    """Minimal event columns for the trace audit (who reasoned / why). Read-only.
+
+    BOUNDED on purpose: the audit is a nudge about current practice, not a historical
+    census, and a briefing must never carry a cost that grows without limit as a project
+    gets chattier. Newest-first + LIMIT rides the existing
+    (project_id, created_at DESC) index, so it never sorts the whole history."""
+    conn = _conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id, event_type, actor_model, decision FROM hyp_events "
+                    "WHERE project_id=%s ORDER BY created_at DESC, id DESC LIMIT %s",
+                    (project_id, limit))
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _decisive_without_observed(hyps):
+    """Decisive verdicts on predictions that REGISTERED a structured threshold but whose
+    evaluation declared no `observed` — so the margin fell back to an authored number.
+
+    Measured motivation (0.68 arm): with margins derivable, one model declared `observed` on
+    zero of six predictions under an identical prompt, its margins fell back to authored
+    values, and adoption variance became the largest resolvable component of the remaining
+    panel spread. The round-1 lesson at the input layer: what the briefing asks for is what
+    models do; what the schema merely permits, they do unevenly. Advisory; never a gate.
+    """
+    out = []
+    for h in (hyps or []):
+        for p in (h.get("predictions") or []):
+            if p.get("verdict") not in ("supports", "contradicts"):
+                continue
+            if not p.get("threshold"):
+                continue
+            if p.get("observed"):
+                continue
+            out.append({"hypothesis_label": h.get("label"),
+                        "prediction_label": p.get("label"),
+                        "descriptor": p.get("descriptor_name"),
+                        "why": "a structured threshold is registered, so the margin can be "
+                               "DERIVED — but no `observed` {value, unit, scale, scale_basis} "
+                               "was declared and the score fell back to your authored margin. "
+                               "Declare what you measured, with the records it comes from."})
+    return out
+
+
+def _strong_without_rival_contrast(hyps):
+    """Decisive verdicts claiming strength='strong' on predictions whose `discriminates`
+    names no RIVAL hypothesis.
+
+    The manifest defines strength by DISCRIMINATION: 'strong' is reserved for an observation
+    that separates rivals, not for a large effect every rival predicts alike. Measured, not
+    hypothetical: across a 30-run frozen-set benchmark, five models split on strength for
+    every item EXCEPT the single one whose observation uniquely killed a rival — that one was
+    unanimous 'strong' in all 30 runs. The variance came from models answering the everyday
+    question ('how big?') instead of the written one ('who predicted otherwise?'), and it was
+    invisible because nothing asked them to show which rival predicted otherwise.
+
+    The machine-checkable core: a 'strong' whose prediction's `discriminates` names only its
+    own hypothesis (or nothing) has, on the record, no rival contrast to point at. Whether a
+    NAMED contrast is genuine stays a judgement, so per the surface-before-gate rule this is
+    ADVISORY: it feeds method_compliance and recommended_actions, never a gate, never a score.
+    Pure over the context structure; no DB.
+    """
+    out = []
+    for h in (hyps or []):
+        own = h.get("label")
+        own = own if isinstance(own, str) else None
+        for p in (h.get("predictions") or []):
+            if p.get("verdict") not in ("supports", "contradicts"):
+                continue
+            if (p.get("strength") or "").strip().lower() != "strong":
+                continue
+            rivals = {d.get("hypothesis_label") for d in (p.get("discriminates") or [])
+                      if isinstance(d, dict) and d.get("hypothesis_label")}
+            rivals.discard(own)
+            if not rivals:
+                out.append({"hypothesis_label": own,
+                            "prediction_label": p.get("label"),
+                            "descriptor": p.get("descriptor_name"),
+                            "why": "strength='strong' but `discriminates` names no rival "
+                                   "hypothesis with a differing expectation. Strong means a "
+                                   "rival predicted otherwise; if none did, this is "
+                                   "consistency and belongs at 'weak' — or add the genuine "
+                                   "rival contrast to `discriminates`."})
+    return out
+
+
+def _descriptor_absent_from_evidence(hyps):
+    """Decisive verdicts whose TESTED QUANTITY appears in none of the records they cite.
+
+    Measured failure, not a hypothetical one. In a frozen-set benchmark where four rival
+    hypotheses and nine falsifiable predictions were handed identically to five agents, eight
+    items came back unanimous and correct. Every error landed on the one item asking about a
+    descriptor that does not exist in the corpus: all three pure-Au records report H2, CO and
+    total FE only, with no faradaic_efficiency.C2H4. Four of five agents returned a DECISIVE
+    verdict anyway. One wrote that pure Au "yields 0 % FE(C2H4)", inventing a number; another
+    stated in its own rationale that the descriptor was absent and ruled regardless.
+
+    A determinism-only benchmark would have scored that item 0.80 and called it agreement.
+    Absence is not zero, and an agent that decides an undecidable question has fabricated
+    evidence, which is the one failure mode a reproducibility metric can never surface,
+    because the agents fail together.
+
+    Advisory. It never touches a score, and a verdict backed by a compute run is exempt
+    because the quantity may legitimately come from a calculation rather than an archive.
+    Read-only; degrades to [] on any records-DB hiccup so a briefing never blocks.
+    """
+    # WITHDRAWN EXEMPTION, kept as a comment so it is not reintroduced.
+    #
+    # A previous version treated total_faradaic_efficiency as BOUNDING an unreported channel,
+    # on the argument that if the reported FEs sum to the total, the missing product must be
+    # ~0. That is circular. In this corpus the field's own `definition` reads "Sum of all
+    # measured product FEs (H2 + CO)", and total minus sum-of-reported is <= 0.0001 on ALL 37
+    # records including ones reporting five channels. It closes by construction. It is an
+    # identity, and an identity constrains nothing.
+    #
+    # The exemption was added because the benchmark author believed four agents had out-reasoned
+    # him; in fact the one agent that answered `insufficient` was right, and the exemption
+    # encoded his error into the platform. A real bound requires an INDEPENDENT charge balance,
+    # or evidence the analysis covered the product class at all (the pure-Au records ran
+    # gc_analysis with no nmr_analysis, so liquid products were never measured).
+    _BOUNDING = set()
+    want = {}                      # descriptor_name -> {record_id}
+    items = []
+    for h in (hyps or []):
+        for p in (h.get("predictions") or []):
+            if p.get("verdict") not in ("supports", "contradicts"):
+                continue
+            if p.get("mlflow_run_url"):
+                continue           # computed quantity: not expected in an archived record
+            desc = p.get("descriptor_name")
+            rids = [r for r in (p.get("evidence_record_ids") or []) if r]
+            if not desc or not rids:
+                continue
+            want.setdefault(desc, set()).update(rids)
+            items.append((h.get("label"), p.get("label"), desc, set(rids)))
+    if not items:
+        return []
+    try:
+        conn = database.get_readonly_db_connection()
+    except Exception:
+        return []
+    have = {}                      # descriptor_name -> {record_id that actually reports it}
+    try:
+        cur = conn.cursor()
+        for desc, rids in want.items():
+            names = [desc]
+            if desc.startswith("faradaic_efficiency."):
+                names += sorted(_BOUNDING)
+            cur.execute(
+                """SELECT record_id FROM records
+                    WHERE record_id = ANY(%s)
+                      AND EXISTS (
+                        SELECT 1
+                          FROM jsonb_array_elements(data->'descriptors'->'outputs') o,
+                               jsonb_array_elements(o->'descriptors') d
+                         WHERE d->>'name' = ANY(%s))""",
+                (list(rids), names))
+            have[desc] = {r["record_id"] for r in cur.fetchall()}
+        cur.close()
+    except Exception:
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    out = []
+    for hlabel, plabel, desc, rids in items:
+        if not (rids & have.get(desc, set())):
+            out.append({"hypothesis_label": hlabel, "prediction_label": plabel,
+                        "descriptor": desc, "cited_records": len(rids),
+                        "why": f"a decisive verdict was recorded on {desc}, but none of the "
+                               f"{len(rids)} cited record(s) report that descriptor. If the "
+                               f"quantity is not measured, the honest verdict is "
+                               f"'insufficient' — absence is not zero."})
+    return out
 
 
 def _evidence_drift_for(hyps):
@@ -3263,6 +3889,60 @@ def get_briefing(project_id, owner_identity=None) -> dict | None:
     # Advisory only — a flag to re-examine; it NEVER moves a score (re-evaluate to re-pin,
     # and the warning clears itself). Records merely browsed (no verdict) are not flagged.
     evidence_drift = _evidence_drift_for(hyps)
+    try:
+        _descriptor_gap = _descriptor_absent_from_evidence(hyps)
+    except Exception:
+        logger.warning("descriptor-evidence check failed", exc_info=True)
+        _descriptor_gap = []
+    try:
+        _strong_gap = _strong_without_rival_contrast(hyps)
+    except Exception:
+        logger.warning("strength-contrast check failed", exc_info=True)
+        _strong_gap = []
+    try:
+        _obs_gap = _decisive_without_observed(hyps)
+    except Exception:
+        logger.warning("observed-declaration check failed", exc_info=True)
+        _obs_gap = []
+    if _obs_gap:
+        _otags = ", ".join(f"{g['prediction_label'] or g['hypothesis_label']}"
+                           for g in _obs_gap[:6])
+        recommended_actions.append(
+            f"DECLARE WHAT YOU OBSERVED: {len(_obs_gap)} decisive verdict(s) sit on "
+            f"predictions with a registered threshold but no `observed` declaration "
+            f"({_otags}). Re-evaluate with observed: {{value, unit, scale, scale_basis}} "
+            "citing the records the numbers come from, so the margin is derived instead of "
+            "authored.")
+    if _strong_gap:
+        _stags = ", ".join(f"{g['prediction_label'] or g['hypothesis_label']}"
+                           for g in _strong_gap[:6])
+        recommended_actions.append(
+            f"STRONG WITHOUT A RIVAL: {len(_strong_gap)} decisive verdict(s) claim "
+            f"strength='strong' on predictions whose `discriminates` names no rival with a "
+            f"differing expectation ({_stags}). Strong is reserved for an observation a "
+            "rival predicted otherwise — effect size alone is consistency. Either add the "
+            "genuine rival contrast to `discriminates` and name it in the rationale, or "
+            "re-evaluate at the tier the discrimination supports.")
+    if _descriptor_gap:
+        _tags = ", ".join(
+            f"{g['prediction_label'] or g['hypothesis_label']}/{g['descriptor']}"
+            for g in _descriptor_gap[:6])
+        recommended_actions.append(
+            f"EVIDENCE DOES NOT CARRY THE QUANTITY: {len(_descriptor_gap)} decisive "
+            f"verdict(s) rest on records that do not report the descriptor under test "
+            f"({_tags}). Re-open each: either cite a record that DOES report it, back it "
+            "with a compute run, or change the verdict to 'insufficient'. A descriptor that "
+            "is absent is not a measured zero, and deciding an undecidable prediction "
+            "fabricates evidence.")
+    # WHO reasoned / WHY. Read-only, advisory, NEVER touches a score. Degrades to empty
+    # on any DB hiccup so it can never block a briefing.
+    try:
+        _trace_gaps = _tp.trace_gaps(_events_for_trace(project_id))
+    except Exception:
+        # Degrade to empty so a briefing is never blocked, but SAY SO: a silently and
+        # permanently empty provenance audit would look like perfect compliance.
+        logger.warning("trace audit unavailable for project %s", project_id, exc_info=True)
+        _trace_gaps = {}
     if evidence_drift:
         _by_hyp = {}
         for _d in evidence_drift:
@@ -3317,11 +3997,37 @@ def get_briefing(project_id, owner_identity=None) -> dict | None:
             "untested_hypotheses_with_idle_tools": untested_with_idle_tools,
             "unverified_or_fabricated_citations": fabricated_citations,
             "circular_confirmations": circular_confirmations,
+            "unattributed_belief_changing_events":
+                _trace_gaps.get("unattributed_belief_changing") or [],
+            "unattributed_belief_changing_count":
+                _trace_gaps.get("unattributed_belief_changing_count") or 0,
+            "reasoning_steps_with_incomplete_decision":
+                _trace_gaps.get("reasoning_steps_with_incomplete_decision") or [],
+            "reasoning_steps_with_incomplete_decision_count":
+                _trace_gaps.get("reasoning_steps_with_incomplete_decision_count") or 0,
+            # An agent decision recorded under the portal's signature. Counted separately
+            # because it is NOT caught by unattributed_*: the field is populated, just
+            # with the wrong actor, so the compliance surface reads clean while the trace
+            # cannot say which model produced the science.
+            "agent_actions_signed_by_portal":
+                _trace_gaps.get("agent_actions_signed_by_portal") or [],
+            "agent_actions_signed_by_portal_count":
+                _trace_gaps.get("agent_actions_signed_by_portal_count") or 0,
+            "models_seen": _trace_gaps.get("models_seen") or {},
+            "trace_audit_window": _TRACE_AUDIT_WINDOW,
             "supports_without_independence_declaration": supports_without_independence,
             "supersessions_without_discriminating_observable": supersedes_without_discriminator,
             "high_confidence_without_independent_review": high_confidence_without_review,
             "compute_verdicts_missing_mlflow_trace": preds_missing_mlflow,
             "decisive_verdicts_uncited_to_data": preds_uncited,
+            # A decisive verdict is CITED but the cited records do not report the quantity
+            # under test. Distinct from `uncited_to_data`, which catches citing nothing;
+            # this catches citing something that cannot settle the question.
+            "decisive_verdict_without_descriptor_in_evidence": _descriptor_gap,
+            # strength='strong' with no rival named in `discriminates` — the machine-
+            # checkable core of the strength-is-discrimination rule. Advisory only.
+            "strong_verdict_without_rival_contrast": _strong_gap,
+            "decisive_verdict_without_observed_declaration": _obs_gap,
             "dataset_records_unused": [r.get("material") or r.get("record_id")
                                        for r in dataset_coverage.get("unused_records", [])],
             "dataset_of_interest_undeclared": not dataset_coverage.get("declared"),
@@ -3391,17 +4097,34 @@ def delete_project(project_id, owner_identity=None, is_admin=False) -> bool:
 # --- Events (the agent's reasoning transcript) -----------------------------
 
 def add_event(project_id, event_type, summary, *, detail=None, hypothesis_id=None,
-              evidence_record_ids=None, mlflow_run_url=None, actor=None) -> int | None:
+              evidence_record_ids=None, mlflow_run_url=None, actor=None,
+              actor_model=None, decision=None) -> int | None:
+    # Refused for EVERY project, legacy included, because this is API misuse rather than a
+    # scientific-contract rule: the event type names a state change that did not occur, and
+    # no project of any vintage benefits from a journal that lies about its own state.
+    _srv = _tp.server_emitted_error(event_type)
+    if _srv:
+        raise TraceContractError(_srv)
     conn = _conn()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT 1 FROM hyp_projects WHERE project_id=%s", (project_id,))
-        if cur.fetchone() is None:
+        cur.execute("SELECT policy_version FROM hyp_projects WHERE project_id=%s",
+                    (project_id,))
+        _row = cur.fetchone()
+        if _row is None:
             return None
+        # Held to the contract the project was BORN under. Legacy projects (NULL) are
+        # advisory-only and behave exactly as before.
+        _err = _tp.enforcement_error(_row.get("policy_version"), event_type,
+                                     actor_model, decision)
+        if _err:
+            raise TraceContractError(_err)
         eid = _append_event(cur, project_id, event_type, summary, detail=detail,
                             hypothesis_id=hypothesis_id,
                             evidence_record_ids=evidence_record_ids,
-                            mlflow_run_url=mlflow_run_url, actor=actor)
+                            mlflow_run_url=mlflow_run_url, actor=actor,
+                            actor_model=actor_model, decision=decision,
+                            server_write=False)
         conn.commit()
         return eid
     finally:
@@ -4134,11 +4857,19 @@ def _load_bearing_verdicts(h, top=3):
         v = normalize_verdict(p.get("verdict"))
         if v not in ("supports", "contradicts"):
             continue
-        sw = _STRENGTH_W.get((p.get("strength") or "").strip().lower(), _STRENGTH_W["weak"])
+        # Match the scoring path: policy>=61 hypotheses rank their load-bearing verdicts
+        # by the DERIVED tier, or the display would disagree with the stored score.
+        try:
+            _drv = int(h.get("policy_version") or 0) >= _tp.POLICY_DERIVED_STRENGTH
+        except (TypeError, ValueError):
+            _drv = False
+        _tier = _derived_strength(p, h.get("label")) if _drv \
+            else (p.get("strength") or "weak")
+        sw = _STRENGTH_W.get((_tier or "").strip().lower(), _STRENGTH_W["weak"])
         refs.append((sw * _margin_factor(p.get("margin")),
                      {"descriptor": p.get("descriptor_name"),
                       "direction": "+" if v == "supports" else "−",
-                      "strength": p.get("strength") or "weak",
+                      "strength": _tier,
                       "cross_system": bool(p.get("cross_system"))}))
     refs.sort(key=lambda x: -x[0])
     return [r for _, r in refs[:top]]
